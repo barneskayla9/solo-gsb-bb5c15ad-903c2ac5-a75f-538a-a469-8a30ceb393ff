@@ -121,11 +121,69 @@ api POST "/points/$RPID/reservations" "{
 }"
 
 echo
-echo "-- touching window 10:00-11:00 is fine (201) --"
-api POST "/points/$RPID/reservations" "{
-  \"idempotency_key\": \"demo-visit-3\",
+echo "-- reschedule 09:00-10:00 -> 10:00-11:00 with the cancel token (200, revision 2) --"
+api POST "/points/$RPID/reservations/$RID/reschedule" "{
+  \"cancel_token\": \"$TOKEN\",
+  \"idempotency_key\": \"demo-reschedule-1\",
+  \"expected_revision\": 1,
   \"start\": \"${D1}T10:00:00Z\",
   \"end\": \"${D1}T11:00:00Z\"
+}"
+
+echo
+echo "-- same reschedule key + same content replays the attempt (200, still revision 2) --"
+api POST "/points/$RPID/reservations/$RID/reschedule" "{
+  \"cancel_token\": \"$TOKEN\",
+  \"idempotency_key\": \"demo-reschedule-1\",
+  \"expected_revision\": 1,
+  \"start\": \"${D1}T10:00:00Z\",
+  \"end\": \"${D1}T11:00:00Z\"
+}"
+
+echo
+echo "-- same reschedule key + different content conflicts (409 idempotency_conflict) --"
+api POST "/points/$RPID/reservations/$RID/reschedule" "{
+  \"cancel_token\": \"$TOKEN\",
+  \"idempotency_key\": \"demo-reschedule-1\",
+  \"expected_revision\": 2,
+  \"start\": \"${D1}T08:00:00Z\",
+  \"end\": \"${D1}T09:00:00Z\"
+}"
+
+echo
+echo "-- stale expected_revision conflicts (409 revision_conflict) --"
+api POST "/points/$RPID/reservations/$RID/reschedule" "{
+  \"cancel_token\": \"$TOKEN\",
+  \"idempotency_key\": \"demo-reschedule-2\",
+  \"expected_revision\": 1,
+  \"start\": \"${D1}T08:00:00Z\",
+  \"end\": \"${D1}T09:00:00Z\"
+}"
+
+echo
+echo "-- reschedule without a valid token is rejected (403 invalid_cancel_token) --"
+api POST "/points/$RPID/reservations/$RID/reschedule" "{
+  \"cancel_token\": \"wrong\",
+  \"idempotency_key\": \"demo-reschedule-3\",
+  \"expected_revision\": 2,
+  \"start\": \"${D1}T08:00:00Z\",
+  \"end\": \"${D1}T09:00:00Z\"
+}"
+
+echo
+echo "-- the original creation key still replays the first-created window (200, revision 1) --"
+api POST "/points/$RPID/reservations" "{
+  \"idempotency_key\": \"demo-visit-1\",
+  \"start\": \"${D1}T09:00:00Z\",
+  \"end\": \"${D1}T10:00:00Z\"
+}"
+
+echo
+echo "-- the old window was freed by rescheduling: 09:00-10:00 can be booked again (201) --"
+api POST "/points/$RPID/reservations" "{
+  \"idempotency_key\": \"demo-visit-3\",
+  \"start\": \"${D1}T09:00:00Z\",
+  \"end\": \"${D1}T10:00:00Z\"
 }"
 
 echo
@@ -156,6 +214,6 @@ echo
 echo "-- the freed window can be booked again (201) --"
 api POST "/points/$RPID/reservations" "{
   \"idempotency_key\": \"demo-visit-5\",
-  \"start\": \"${D1}T09:00:00Z\",
-  \"end\": \"${D1}T10:00:00Z\"
+  \"start\": \"${D1}T10:00:00Z\",
+  \"end\": \"${D1}T11:00:00Z\"
 }"

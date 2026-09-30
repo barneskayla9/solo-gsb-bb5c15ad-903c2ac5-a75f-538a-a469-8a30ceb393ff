@@ -160,6 +160,60 @@ def main() -> None:
     )
     show("overlapping window rejected", status, overlap)
 
+    # --- Reschedule with the cancel token: 09:00-10:00 -> 10:00-11:00 ----
+    reschedule_body = {
+        "cancel_token": token,
+        "idempotency_key": "visit-demo-1-move",
+        "expected_revision": 1,
+        "start": f"{tomorrow}T10:00:00Z",
+        "end": f"{tomorrow}T11:00:00Z",
+    }
+    status, moved = call(
+        "POST",
+        f"/points/{rpid}/reservations/{rid}/reschedule",
+        reschedule_body,
+    )
+    show("reschedule with the cancel token (revision bumps to 2)", status, moved)
+
+    status, replay = call(
+        "POST",
+        f"/points/{rpid}/reservations/{rid}/reschedule",
+        reschedule_body,
+    )
+    show("same reschedule key + content replays the attempt (200)", status, replay)
+
+    status, rs_conflict = call(
+        "POST",
+        f"/points/{rpid}/reservations/{rid}/reschedule",
+        {
+            "cancel_token": token,
+            "idempotency_key": "visit-demo-1-move",
+            "expected_revision": 2,
+            "start": f"{tomorrow}T08:00:00Z",
+            "end": f"{tomorrow}T09:00:00Z",
+        },
+    )
+    show("same reschedule key, different content conflicts", status, rs_conflict)
+
+    status, stale = call(
+        "POST",
+        f"/points/{rpid}/reservations/{rid}/reschedule",
+        {
+            "cancel_token": token,
+            "idempotency_key": "visit-demo-1-move-again",
+            "expected_revision": 1,  # stale: the reservation is now at revision 2
+            "start": f"{tomorrow}T08:00:00Z",
+            "end": f"{tomorrow}T09:00:00Z",
+        },
+    )
+    show("stale expected_revision conflicts", status, stale)
+
+    # The creation key is unaffected: it still replays the first-created window.
+    status, create_replay = call(
+        "POST", f"/points/{rpid}/reservations", window
+    )
+    show("creation key replay still returns the original window", status, create_replay)
+
     status, blocked = call(
         "POST",
         f"/points/{rpid}/rules",

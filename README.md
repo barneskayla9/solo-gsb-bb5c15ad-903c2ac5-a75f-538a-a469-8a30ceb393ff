@@ -105,10 +105,23 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
     原样返回首次结果（HTTP 200），不同内容报 `idempotency_conflict`；
   - 取消需同时给出预约号与创建时签发的取消凭证；重复取消幂等返回
     已取消状态；已取消预约不再占用时段、也不再阻止规则变更；
+  - **凭凭证改期**：对未取消且尚未开始的预约，可凭同一取消凭证把预约改到
+    新的带时区起止时间。请求须给出客户本次改期幂等键与期望修订号
+    （`revision`，创建时为 `1`，每次成功改期 +1）；新窗口按创建预约的同一套
+    规则校验（未来窗口/最长时长/当前已发布日历的连续开放区间/同点未取消预约
+    不重叠，判重时忽略自身）。成功后**预约号与取消凭证保持不变**，更新起止、
+    所依据规则版本与修订号并返回当前预约；任何校验失败整体回滚，**不释放原
+    时段**。同一预约同一改期键同内容重试返回该次成功结果，异内容返回
+    `idempotency_conflict`；期望修订号过期返回 `revision_conflict`。
+    预约不存在、凭证错误沿用取消接口的 404/403 语义；已取消或已开始的预约
+    不可改，返回 `reservation_not_reschedulable`。
+  - **原创建幂等键不受改期影响**：创建键的同内容重试始终以**首次创建**的
+    起止与凭证为准（响应中的窗口/规则版本/修订号 `1` 即首次创建快照，状态
+    字段反映当前状态），异内容仍报 `idempotency_conflict`。
   - **变更保护**：发布新规则或修改时区时，若任一尚未结束的未取消预约
     在新日历下不再完整开放，整个变更被拒绝并返回冲突预约号列表；
-    预约创建、规则发布与时区修改在同一回收点行锁下串行，并发下同样满足
-    上述约束。
+    预约创建、改期、规则发布与时区修改在同一回收点行锁下串行，并发下同样
+    满足日历覆盖与无重叠。
 
 ---
 
@@ -207,6 +220,7 @@ GET /points/{id}/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD[&version=N]
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/points/{id}/reservations` | 创建预约（201；同键同内容重试为 200） |
+| `POST` | `/points/{id}/reservations/{rid}/reschedule` | 凭取消凭证改期（200；同键同内容重试原样返回） |
 | `POST` | `/points/{id}/reservations/{rid}/cancel` | 凭取消凭证取消（200，可重复） |
 
 创建请求体（`start`/`end` 为带时区偏移的 ISO-8601 时间戳，统一按 UTC 解释）：
@@ -219,13 +233,14 @@ GET /points/{id}/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD[&version=N]
 }
 ```
 
-成功响应（201）包含**预约号、取消凭证与所依据的规则版本**：
+成功响应（201）包含**预约号、取消凭证、修订号与所依据的规则版本**：
 
 ```json
 {
   "id": 7,
   "point_id": 1,
   "status": "active",
+  "revision": 1,
   "start": "2026-10-01T09:00:00Z",
   "end": "2026-10-01T10:00:00Z",
   "rules_version": 3,
@@ -236,11 +251,66 @@ GET /points/{id}/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD[&version=N]
 ```
 
 - 同一回收点内同一 `idempotency_key` 以首次成功请求为准：同内容重试返回
-  首次结果（HTTP 200，即使该预约后来被取消）；不同内容返回
+  首次创建快照（HTTP 200，即使该预约后来被改期或取消——窗口/规则版本/
+  `revision: 1` 为首次创建内容，状态字段反映当前状态）；不同内容返回
   `409 idempotency_conflict`。
 - 取消请求体为 `{ "cancel_token": "…" }`；凭证缺失或错误返回
   `403 invalid_cancel_token`。成功或重复取消均返回 200 与当前状态
   （`status: "cancelled"`，响应不含取消凭证）。
+
+#### 改期（reschedule）
+
+请求体：
+
+```json
+{
+  "cancel_token": "r9vQ…",
+  "idempotency_key": "move-order-0001-to-afternoon",
+  "expected_revision": 1,
+  "start": "2026-10-01T11:00:00Z",
+  "end": "2026-10-01T11:30:00Z"
+}
+```
+
+- `cancel_token`：创建时签发的取消凭证（改期与取消共用同一能力凭证，
+  成功改期后凭证不变）。
+- `expected_revision`：客户端看到的修订号；创建成功为 `1`，之后每次成功
+  改期 +1。与服务端不符返回 `409 revision_conflict`（`details` 给出
+  `expected_revision` 与 `current_revision`）。
+- `idempotency_key`：**本次改期**的幂等键，按预约隔离，与创建键相互独立。
+- `start`/`end`：新的带时区偏移起止时间，须通过与创建相同的窗口/时长/
+  开放区间/重叠校验（重叠判定忽略该预约自身，故新旧窗口可以交叠；
+  首尾相接亦可）。
+
+成功返回 200 与更新后的预约（与创建响应同构，含取消凭证）：
+
+```json
+{
+  "id": 7,
+  "point_id": 1,
+  "status": "active",
+  "revision": 2,
+  "start": "2026-10-01T11:00:00Z",
+  "end": "2026-10-01T11:30:00Z",
+  "rules_version": 3,
+  "cancel_token": "r9vQ…",
+  "created_at": "2026-09-30T08:00:00Z",
+  "cancelled_at": null
+}
+```
+
+- 同一预约同一改期键、**同内容**重试返回该次成功结果（HTTP 200，修订号
+  不再增加；即使此后又改过期或已取消，也返回该次结果对应的窗口，状态字段
+  反映当前状态）；**异内容**重试返回 `409 idempotency_conflict`
+  （`details` 给出该键已存的窗口）。
+- 仅未取消且尚未开始（当前时间早于预约起点）的预约可改；否则返回
+  `409 reservation_not_reschedulable`，`details.reason` 为
+  `reservation_cancelled` 或 `reservation_started`。
+- 新窗口不合法（终点不晚于起点、超过最长时长、起点在过去或超出可约天数）
+  返回 `422 invalid_period`；不落在当前已发布日历的连续开放区间内返回
+  `409 outside_open_hours`；与同点**其他**未取消预约重叠返回
+  `409 reservation_overlap`。
+- 任一失败均在同一事务内回滚：原时段继续被占用，修订号与窗口不变。
 
 ### 4.5 可区分错误码
 
@@ -253,8 +323,10 @@ GET /points/{id}/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD[&version=N]
 | 409 | `no_published_version` | 尚无已发布规则（当前版本为 0）就查询日历或创建预约 |
 | 409 | `version_conflict` | `expected_version` 与服务端当前版本不符（`details` 给出双方版本号） |
 | 409 | `idempotency_conflict` | 同一回收点同一幂等键提交了不同的起止时间（`details` 给出已存预约） |
-| 409 | `reservation_overlap` | 与同点未取消预约 UTC 时间重叠（`details` 给出冲突预约号） |
-| 409 | `outside_open_hours` | 预约未完整落在当前已发布日历的任一段连续开放区间内 |
+| 409 | `reservation_overlap` | 与同点未取消预约 UTC 时间重叠（创建时；改期时忽略自身，`details` 给出冲突预约号） |
+| 409 | `outside_open_hours` | 预约（或改期后的新窗口）未完整落在当前已发布日历的任一段连续开放区间内 |
+| 409 | `revision_conflict` | 改期 `expected_revision` 与预约当前修订号不符（`details` 给出双方修订号） |
+| 409 | `reservation_not_reschedulable` | 改期对象已取消或已开始（`details.reason` 区分 `reservation_cancelled` / `reservation_started`） |
 | 409 | `reservation_change_conflict` | 发布规则或修改时区将使未取消预约不再完整开放（`details.conflicting_reservation_ids` 给出冲突预约号） |
 | 422 | `invalid_period` | 无效时段：星期越界、时间格式错、常规起终点相等、补开跨日/零长度、重复规则、日期范围倒置/超限；预约终点不晚于起点、超过最长时长、起点在过去或超出可约天数 |
 | 422 | `unknown_timezone` | 无法识别的 IANA 时区 |
@@ -297,6 +369,15 @@ curl -s -X POST localhost:8000/points/1/reservations \
 curl -s -X POST localhost:8000/points/1/reservations/7/cancel \
   -H 'Content-Type: application/json' \
   -d '{"cancel_token":"<创建响应中的 cancel_token>"}'
+
+# 凭同一取消凭证改期（带期望修订号与本次改期幂等键）
+curl -s -X POST localhost:8000/points/1/reservations/7/reschedule \
+  -H 'Content-Type: application/json' \
+  -d '{"cancel_token":"<创建响应中的 cancel_token>",
+       "idempotency_key":"move-visit-7-to-11",
+       "expected_revision":1,
+       "start":"2026-10-01T11:00:00Z",
+       "end":"2026-10-01T11:30:00Z"}'
 ```
 
 ---
@@ -322,6 +403,10 @@ pytest -q
 - 预约：窗口策略（30 天/2 小时/未来起点）、幂等键首请求为准与同内容重放、
   异内容冲突、跨午夜连续区间判定、重叠拒绝与首尾相接并存、凭证取消与重复取消、
   取消后时段释放、发布/改时区的预约保护与并发下恰好一方成功；
+- 改期：成功改期保留预约号与凭证并推进修订号、同键同内容重放该次结果
+  （含再改期/取消后重放）、异内容冲突、过期修订号冲突、已取消/已开始不可改、
+  新窗口窗口策略/开放区间/重叠（忽略自身）校验、失败不释放原时段、原创建键
+  重试仍按首次创建内容判定、改期与取消/发布并发下结果一致且无 500；
 - 全部可区分错误码。
 
 ---

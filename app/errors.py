@@ -88,3 +88,17 @@ class ReservationChangeConflictError(ApiError):
 
     status_code = 409
     code = "reservation_change_conflict"
+
+
+class RevisionConflictError(ApiError):
+    """Reschedule expected_revision does not match the reservation's revision."""
+
+    status_code = 409
+    code = "revision_conflict"
+
+
+class ReservationNotReschedulableError(ApiError):
+    """The reservation cannot be rescheduled (cancelled or already started)."""
+
+    status_code = 409
+    code = "reservation_not_reschedulable"

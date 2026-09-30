@@ -80,6 +80,30 @@ class ReservationCancelIn(BaseModel):
     cancel_token: str | None = None
 
 
+class ReservationRescheduleIn(BaseModel):
+    """Reschedule request: capability token + optimistic revision + new window.
+
+    ``idempotency_key`` is scoped to this reservation (independent of the
+    creation key) and makes retrying the same reschedule attempt safe.
+    """
+
+    cancel_token: str | None = None
+    expected_revision: int = Field(ge=1)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    start: datetime
+    end: datetime
+
+    @field_validator("start", "end")
+    @classmethod
+    def _must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "must be an ISO-8601 timestamp with an explicit UTC offset "
+                "(e.g. 2026-10-01T09:00:00Z)"
+            )
+        return value
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -270,11 +294,12 @@ class VersionOut(BaseModel):
 
 
 class ReservationOut(BaseModel):
-    """Returned on creation and on same-content idempotent replays."""
+    """Returned on creation, rescheduling and same-content idempotent replays."""
 
     id: int
     point_id: int
     status: str
+    revision: int
     start: str
     end: str
     rules_version: int
@@ -289,6 +314,7 @@ class ReservationStateOut(BaseModel):
     id: int
     point_id: int
     status: str
+    revision: int
     start: str
     end: str
     rules_version: int

@@ -18,7 +18,9 @@ from .errors import (
     IdempotencyConflictError,
     InvalidPeriodError,
     OutsideOpenHoursError,
+    ReservationNotReschedulableError,
     ReservationOverlapError,
+    RevisionConflictError,
 )
 from .schemas import (
     CalendarOut,
@@ -32,6 +34,7 @@ from .schemas import (
     ReservationCancelIn,
     ReservationCreateIn,
     ReservationOut,
+    ReservationRescheduleIn,
     ReservationStateOut,
     VersionOut,
     VersionSummaryOut,
@@ -290,9 +293,31 @@ def _reservation_out(row: dict) -> ReservationOut:
         id=row["id"],
         point_id=row["point_id"],
         status=row["status"],
+        revision=row["revision"],
         start=utc_iso(row["start_utc"]),
         end=utc_iso(row["end_utc"]),
         rules_version=row["rules_version"],
+        cancel_token=row["cancel_token"],
+        created_at=row["created_at"],
+        cancelled_at=row["cancelled_at"],
+    )
+
+
+def _creation_replay_out(row: dict) -> ReservationOut:
+    """First-creation snapshot, with the reservation's live status.
+
+    A create-key replay always reports the *original* created window, rules
+    version and revision 1 (even after reschedules), while status /
+    cancelled_at reflect the reservation as it stands now.
+    """
+    return ReservationOut(
+        id=row["id"],
+        point_id=row["point_id"],
+        status=row["status"],
+        revision=1,
+        start=utc_iso(row["created_start_utc"]),
+        end=utc_iso(row["created_end_utc"]),
+        rules_version=row["created_rules_version"],
         cancel_token=row["cancel_token"],
         created_at=row["created_at"],
         cancelled_at=row["cancelled_at"],
@@ -304,6 +329,7 @@ def _reservation_state_out(row: dict) -> ReservationStateOut:
         id=row["id"],
         point_id=row["point_id"],
         status=row["status"],
+        revision=row["revision"],
         start=utc_iso(row["start_utc"]),
         end=utc_iso(row["end_utc"]),
         rules_version=row["rules_version"],
@@ -332,22 +358,26 @@ def create_reservation(
             point = db.lock_point(cur, point_id)
 
             # Idempotency: the first successful request wins.  A same-content
-            # retry replays its stored result (even if it has since been
-            # cancelled); different content under the same key conflicts.
+            # retry replays the *first creation* snapshot (even if it has since
+            # been rescheduled or cancelled); different content under the same
+            # key conflicts.
             existing = db.get_reservation_by_key(
                 cur, point_id, body.idempotency_key
             )
             if existing is not None:
-                if existing["start_utc"] == start and existing["end_utc"] == end:
+                if (
+                    existing["created_start_utc"] == start
+                    and existing["created_end_utc"] == end
+                ):
                     response.status_code = 200
-                    return _reservation_out(existing)
+                    return _creation_replay_out(existing)
                 raise IdempotencyConflictError(
                     f"idempotency key {body.idempotency_key!r} was already used "
                     f"on point {point_id} with a different time window",
                     details={
                         "reservation_id": existing["id"],
-                        "start": utc_iso(existing["start_utc"]),
-                        "end": utc_iso(existing["end_utc"]),
+                        "start": utc_iso(existing["created_start_utc"]),
+                        "end": utc_iso(existing["created_end_utc"]),
                     },
                 )
 
@@ -417,3 +447,169 @@ def cancel_reservation(
                 connection.cursor(), point_id, reservation_id, body.cancel_token
             )
     return _reservation_state_out(row)
+
+
+def _reschedule_replay_out(reservation: dict, attempt: dict) -> ReservationOut:
+    """Build the response of a successful reschedule attempt on replay.
+
+    The window / rules version / revision come from the stored attempt; the
+    status fields come from the reservation's current live row (so a replay
+    after a later cancellation reports ``cancelled``).
+    """
+    return ReservationOut(
+        id=reservation["id"],
+        point_id=reservation["point_id"],
+        status=reservation["status"],
+        revision=attempt["revision"],
+        start=utc_iso(attempt["start_utc"]),
+        end=utc_iso(attempt["end_utc"]),
+        rules_version=attempt["rules_version"],
+        cancel_token=reservation["cancel_token"],
+        created_at=reservation["created_at"],
+        cancelled_at=reservation["cancelled_at"],
+    )
+
+
+@app.post(
+    "/points/{point_id}/reservations/{reservation_id}/reschedule",
+    response_model=ReservationOut,
+    tags=["reservations"],
+)
+def reschedule_reservation(
+    point_id: int, reservation_id: int, body: ReservationRescheduleIn
+) -> ReservationOut:
+    start = body.start.astimezone(timezone.utc)
+    end = body.end.astimezone(timezone.utc)
+    now = datetime.now(timezone.utc)
+    with db.conn() as connection:
+        with connection.transaction():
+            cur = connection.cursor()
+            # Same per-point lock as creation / rule publishing / timezone
+            # changes, so a reschedule never races a calendar change or
+            # another booking, and calendar coverage + non-overlap hold under
+            # concurrency.
+            point = db.lock_point(cur, point_id)
+
+            # 404 / 403 semantics mirror the cancel endpoint: existence first,
+            # then the capability token.
+            resv = db.get_reservation_for_update(cur, point_id, reservation_id)
+            db.check_cancel_token(resv, body.cancel_token)
+
+            # Reschedule idempotency is scoped to one reservation: same key +
+            # same content replays that successful attempt (even when the
+            # reservation has since moved on or been cancelled); same key +
+            # different content conflicts.  Replay wins over every other
+            # state/revision check.
+            attempt = db.get_reschedule_by_key(
+                cur, reservation_id, body.idempotency_key
+            )
+            if attempt is not None:
+                if attempt["start_utc"] == start and attempt["end_utc"] == end:
+                    return _reschedule_replay_out(resv, attempt)
+                raise IdempotencyConflictError(
+                    f"reschedule idempotency key {body.idempotency_key!r} was "
+                    f"already used on reservation {reservation_id} with a "
+                    f"different time window",
+                    details={
+                        "reservation_id": reservation_id,
+                        "start": utc_iso(attempt["start_utc"]),
+                        "end": utc_iso(attempt["end_utc"]),
+                    },
+                )
+
+            if resv["status"] == "cancelled":
+                raise ReservationNotReschedulableError(
+                    f"reservation {reservation_id} is cancelled and cannot be "
+                    f"rescheduled",
+                    details={
+                        "reservation_id": reservation_id,
+                        "status": "cancelled",
+                        "reason": "reservation_cancelled",
+                    },
+                )
+            if resv["start_utc"] <= now:
+                raise ReservationNotReschedulableError(
+                    f"reservation {reservation_id} has already started and "
+                    f"cannot be rescheduled",
+                    details={
+                        "reservation_id": reservation_id,
+                        "status": resv["status"],
+                        "reason": "reservation_started",
+                        "start": utc_iso(resv["start_utc"]),
+                        "now": utc_iso(now),
+                    },
+                )
+            if resv["revision"] != body.expected_revision:
+                raise RevisionConflictError(
+                    f"expected revision {body.expected_revision} but reservation "
+                    f"{reservation_id} is at revision {resv['revision']}",
+                    details={
+                        "reservation_id": reservation_id,
+                        "expected_revision": body.expected_revision,
+                        "current_revision": resv["revision"],
+                    },
+                )
+
+            validate_reservation_window(
+                start,
+                end,
+                now,
+                max_days_ahead=settings.reservation_max_days_ahead,
+                max_duration=timedelta(
+                    minutes=settings.reservation_max_duration_minutes
+                ),
+            )
+
+            # The new window must fit inside one continuous open interval of
+            # the currently published calendar.
+            _, rules_row = db.get_current_rules(cur, point_id)
+            zone = get_zone(point["timezone"])
+            ruleset = payload_to_ruleset(rules_row["payload"])
+            date_from = (start - timedelta(days=1)).astimezone(zone).date()
+            date_to = (end + timedelta(days=1)).astimezone(zone).date()
+            intervals = build_open_intervals(
+                point["timezone"], ruleset, date_from, date_to
+            )
+            if not any(s <= start and end <= e for s, e in intervals):
+                raise OutsideOpenHoursError(
+                    "rescheduled window is not fully contained in one "
+                    "continuous open interval of the published calendar",
+                    details={
+                        "reservation_id": reservation_id,
+                        "start": utc_iso(start),
+                        "end": utc_iso(end),
+                        "rules_version": rules_row["version"],
+                    },
+                )
+
+            # Overlap against other active reservations; this reservation's
+            # own (still held) old window is ignored.
+            overlapping = db.find_overlapping(
+                cur,
+                point_id,
+                start,
+                end,
+                exclude_reservation_id=reservation_id,
+            )
+            if overlapping:
+                raise ReservationOverlapError(
+                    "rescheduled window overlaps another active reservation",
+                    details={
+                        "conflicting_reservation_ids": [r["id"]]
+                        for r in overlapping
+                    },
+                )
+
+            attempt = db.apply_reschedule(
+                cur,
+                resv,
+                body.idempotency_key,
+                body.expected_revision,
+                start,
+                end,
+                rules_row["version"],
+            )
+            # Rescheduling only moves the window and bumps the revision;
+            # status / cancel token / created_at are unchanged, so the locked
+            # ``resv`` row plus the stored attempt fully describe the result.
+            return _reschedule_replay_out(resv, attempt)
