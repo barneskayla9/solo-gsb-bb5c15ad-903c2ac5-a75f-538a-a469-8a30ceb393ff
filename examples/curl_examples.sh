@@ -159,3 +159,94 @@ api POST "/points/$RPID/reservations" "{
   \"start\": \"${D1}T09:00:00Z\",
   \"end\": \"${D1}T10:00:00Z\"
 }"
+
+echo
+echo "== 8. Reschedule with the cancel token (凭取消凭证改期) =="
+# Book a fresh reservation for the reschedule walk-through.
+MOVE_JSON="$(api POST "/points/$RPID/reservations" "{
+  \"idempotency_key\": \"demo-move-1\",
+  \"start\": \"${D1}T08:00:00Z\",
+  \"end\": \"${D1}T08:30:00Z\"
+}")"
+echo "-- created: id + cancel_token + revision 1 --"
+echo "$MOVE_JSON"
+MID="$(echo "$MOVE_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+MTOKEN="$(echo "$MOVE_JSON" | sed -n 's/.*"cancel_token":"\([^"]*\)".*/\1/p')"
+
+echo
+echo "-- reschedule to 11:00-11:30 with expected_revision 1 (200, revision becomes 2) --"
+api POST "/points/$RPID/reservations/$MID/reschedule" "{
+  \"cancel_token\": \"$MTOKEN\",
+  \"expected_revision\": 1,
+  \"idempotency_key\": \"demo-move-1#r1\",
+  \"start\": \"${D1}T11:00:00Z\",
+  \"end\": \"${D1}T11:30:00Z\"
+}"
+
+echo
+echo "-- retry with the same reschedule key + same content replays the stored success (200) --"
+api POST "/points/$RPID/reservations/$MID/reschedule" "{
+  \"cancel_token\": \"$MTOKEN\",
+  \"expected_revision\": 1,
+  \"idempotency_key\": \"demo-move-1#r1\",
+  \"start\": \"${D1}T11:00:00Z\",
+  \"end\": \"${D1}T11:30:00Z\"
+}"
+
+echo
+echo "-- same key + different content conflicts (409 idempotency_conflict) --"
+api POST "/points/$RPID/reservations/$MID/reschedule" "{
+  \"cancel_token\": \"$MTOKEN\",
+  \"expected_revision\": 2,
+  \"idempotency_key\": \"demo-move-1#r1\",
+  \"start\": \"${D1}T08:00:00Z\",
+  \"end\": \"${D1}T08:30:00Z\"
+}"
+
+echo
+echo "-- stale expected_revision conflicts (409 reservation_revision_conflict) --"
+api POST "/points/$RPID/reservations/$MID/reschedule" "{
+  \"cancel_token\": \"$MTOKEN\",
+  \"expected_revision\": 1,
+  \"idempotency_key\": \"demo-move-1#r2\",
+  \"start\": \"${D1}T10:00:00Z\",
+  \"end\": \"${D1}T10:30:00Z\"
+}"
+
+echo
+echo "-- wrong cancel token is refused with cancel's semantics (403 invalid_cancel_token) --"
+api POST "/points/$RPID/reservations/$MID/reschedule" "{
+  \"cancel_token\": \"wrong\",
+  \"expected_revision\": 2,
+  \"idempotency_key\": \"demo-move-1#r3\",
+  \"start\": \"${D1}T10:00:00Z\",
+  \"end\": \"${D1}T10:30:00Z\"
+}"
+
+echo
+echo "-- outside open hours leaves the reservation untouched (409 outside_open_hours) --"
+api POST "/points/$RPID/reservations/$MID/reschedule" "{
+  \"cancel_token\": \"$MTOKEN\",
+  \"expected_revision\": 2,
+  \"idempotency_key\": \"demo-move-1#r4\",
+  \"start\": \"${D1}T13:00:00Z\",
+  \"end\": \"${D1}T14:00:00Z\"
+}"
+
+echo
+echo "-- valid move to 11:30-12:00 succeeds (200, revision becomes 3) --"
+api POST "/points/$RPID/reservations/$MID/reschedule" "{
+  \"cancel_token\": \"$MTOKEN\",
+  \"expected_revision\": 2,
+  \"idempotency_key\": \"demo-move-1#r5\",
+  \"start\": \"${D1}T11:30:00Z\",
+  \"end\": \"${D1}T12:00:00Z\"
+}"
+
+echo
+echo "-- the original create key still replays the FIRST booking (08:00-08:30, token unchanged) --"
+api POST "/points/$RPID/reservations" "{
+  \"idempotency_key\": \"demo-move-1\",
+  \"start\": \"${D1}T08:00:00Z\",
+  \"end\": \"${D1}T08:30:00Z\"
+}"

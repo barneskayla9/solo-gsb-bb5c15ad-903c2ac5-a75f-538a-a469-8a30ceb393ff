@@ -299,6 +299,7 @@ def get_latest_payload(cur: psycopg.Cursor, point_id: int) -> dict | None:
 
 _RESERVATION_COLS = (
     "id, point_id, idempotency_key, start_utc, end_utc, rules_version, "
+    "revision, orig_start_utc, orig_end_utc, orig_rules_version, "
     "cancel_token, status, created_at, cancelled_at"
 )
 
@@ -313,6 +314,25 @@ def get_reservation_by_key(
     ).fetchone()
 
 
+def get_reservation_for_update(
+    cur: psycopg.Cursor, point_id: int, reservation_id: int
+) -> dict | None:
+    """Lock one reservation row ``FOR UPDATE``; ``None`` when it does not exist."""
+    return cur.execute(
+        f"SELECT {_RESERVATION_COLS} FROM reservations "
+        "WHERE id = %s AND point_id = %s FOR UPDATE",
+        (reservation_id, point_id),
+    ).fetchone()
+
+
+def assert_cancel_token(row: dict, cancel_token: str | None) -> None:
+    """Validate a cancel capability token, sharing cancel's error semantics."""
+    if cancel_token is None:
+        raise InvalidCancelTokenError("cancel_token is required")
+    if not secrets.compare_digest(row["cancel_token"], cancel_token):
+        raise InvalidCancelTokenError("cancel_token does not match")
+
+
 def insert_reservation(
     cur: psycopg.Cursor,
     point_id: int,
@@ -324,11 +344,16 @@ def insert_reservation(
     return cur.execute(
         f"INSERT INTO reservations "
         f"(point_id, idempotency_key, start_utc, end_utc, rules_version, "
+        f" revision, orig_start_utc, orig_end_utc, orig_rules_version, "
         f" cancel_token) "
-        f"VALUES (%s, %s, %s, %s, %s, %s) RETURNING {_RESERVATION_COLS}",
+        f"VALUES (%s, %s, %s, %s, %s, 1, %s, %s, %s, %s) "
+        f"RETURNING {_RESERVATION_COLS}",
         (
             point_id,
             idempotency_key,
+            start_utc,
+            end_utc,
+            rules_version,
             start_utc,
             end_utc,
             rules_version,
@@ -338,39 +363,43 @@ def insert_reservation(
 
 
 def find_overlapping(
-    cur: psycopg.Cursor, point_id: int, start_utc: datetime, end_utc: datetime
+    cur: psycopg.Cursor,
+    point_id: int,
+    start_utc: datetime,
+    end_utc: datetime,
+    exclude_reservation_id: int | None = None,
 ) -> list[dict]:
     """Active reservations overlapping ``[start_utc, end_utc)``.
 
     Strict inequality on both sides means reservations that merely touch
-    (one ends exactly when the other starts) coexist peacefully.
+    (one ends exactly when the other starts) coexist peacefully.  When
+    rescheduling, the reservation's own (current, still-active) row is
+    excluded so it never conflicts with itself.
     """
-    return cur.execute(
+    sql = (
         "SELECT id, start_utc, end_utc FROM reservations "
         "WHERE point_id = %s AND status = 'active' "
-        "AND start_utc < %s AND end_utc > %s ORDER BY id",
-        (point_id, end_utc, start_utc),
-    ).fetchall()
+        "AND start_utc < %s AND end_utc > %s "
+    )
+    params: list = [point_id, end_utc, start_utc]
+    if exclude_reservation_id is not None:
+        sql += "AND id != %s "
+        params.append(exclude_reservation_id)
+    sql += "ORDER BY id"
+    return cur.execute(sql, params).fetchall()
 
 
 def cancel_reservation(
     cur: psycopg.Cursor, point_id: int, reservation_id: int, cancel_token: str | None
 ) -> dict:
     """Cancel one reservation; idempotent on repeat calls with the token."""
-    row = cur.execute(
-        f"SELECT {_RESERVATION_COLS} FROM reservations "
-        "WHERE id = %s AND point_id = %s FOR UPDATE",
-        (reservation_id, point_id),
-    ).fetchone()
+    row = get_reservation_for_update(cur, point_id, reservation_id)
     if row is None:
         raise ReservationNotFoundError(
             f"reservation {reservation_id} of point {point_id} does not exist",
             details={"point_id": point_id, "reservation_id": reservation_id},
         )
-    if cancel_token is None:
-        raise InvalidCancelTokenError("cancel_token is required")
-    if not secrets.compare_digest(row["cancel_token"], cancel_token):
-        raise InvalidCancelTokenError("cancel_token does not match")
+    assert_cancel_token(row, cancel_token)
     if row["status"] == "cancelled":
         return row
     return cur.execute(
@@ -378,6 +407,69 @@ def cancel_reservation(
         f"WHERE id = %s RETURNING {_RESERVATION_COLS}",
         (reservation_id,),
     ).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Reschedules
+# ---------------------------------------------------------------------------
+
+_RESCHEDULE_COLS = (
+    "id, reservation_id, point_id, idempotency_key, expected_revision, "
+    "start_utc, end_utc, rules_version, resulting_revision, created_at"
+)
+
+
+def get_reschedule_by_key(
+    cur: psycopg.Cursor, reservation_id: int, idempotency_key: str
+) -> dict | None:
+    return cur.execute(
+        f"SELECT {_RESCHEDULE_COLS} FROM reservation_reschedules "
+        "WHERE reservation_id = %s AND idempotency_key = %s",
+        (reservation_id, idempotency_key),
+    ).fetchone()
+
+
+def apply_reschedule(
+    cur: psycopg.Cursor,
+    reservation: dict,
+    idempotency_key: str,
+    expected_revision: int,
+    start_utc: datetime,
+    end_utc: datetime,
+    rules_version: int,
+) -> tuple[dict, dict]:
+    """Apply one validated reschedule atomically.
+
+    Moves the reservation to the new window, bumps ``revision`` and records
+    the successful attempt (with its resulting revision) under the
+    reschedule idempotency key.  Callers hold the reservation and point row
+    locks and have already validated the window, calendar and overlaps.
+    """
+    new_revision = reservation["revision"] + 1
+    row = cur.execute(
+        f"UPDATE reservations "
+        f"SET start_utc = %s, end_utc = %s, rules_version = %s, "
+        f"    revision = %s WHERE id = %s RETURNING {_RESERVATION_COLS}",
+        (start_utc, end_utc, rules_version, new_revision, reservation["id"]),
+    ).fetchone()
+    attempt = cur.execute(
+        f"INSERT INTO reservation_reschedules "
+        f"(reservation_id, point_id, idempotency_key, expected_revision, "
+        f" start_utc, end_utc, rules_version, resulting_revision) "
+        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+        f"RETURNING {_RESCHEDULE_COLS}",
+        (
+            reservation["id"],
+            reservation["point_id"],
+            idempotency_key,
+            expected_revision,
+            start_utc,
+            end_utc,
+            rules_version,
+            new_revision,
+        ),
+    ).fetchone()
+    return row, attempt
 
 
 def assert_reservations_fit(

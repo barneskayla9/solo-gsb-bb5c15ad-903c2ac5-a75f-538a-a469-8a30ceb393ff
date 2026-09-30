@@ -184,6 +184,96 @@ def main() -> None:
     )
     show("repeat cancel returns the cancelled state", status, again)
 
+    # ------------------------------------------------------------------
+    # Rescheduling: present the cancel token, the expected revision and a
+    # reschedule-specific idempotency key with the new tz-aware window.
+    # ------------------------------------------------------------------
+    window_08 = {
+        "idempotency_key": "visit-demo-move",
+        "start": f"{tomorrow}T08:00:00Z",
+        "end": f"{tomorrow}T08:30:00Z",
+    }
+    status, movable = call("POST", f"/points/{rpid}/reservations", window_08)
+    show("book 08:00-08:30 for the reschedule demo", status, movable)
+    mrid = movable["id"]
+    mtoken = movable["cancel_token"]
+
+    moved_window = {
+        "cancel_token": mtoken,
+        "expected_revision": 1,
+        "idempotency_key": "visit-demo-move#r1",
+        "start": f"{tomorrow}T11:00:00Z",
+        "end": f"{tomorrow}T11:30:00Z",
+    }
+    status, moved = call(
+        "POST", f"/points/{rpid}/reservations/{mrid}/reschedule", moved_window
+    )
+    show("reschedule to 11:00-11:30 (revision 1 -> 2)", status, moved)
+
+    status, replay = call(
+        "POST", f"/points/{rpid}/reservations/{mrid}/reschedule", moved_window
+    )
+    show("same reschedule key + content replays the success (200)", status, replay)
+
+    status, diff_content = call(
+        "POST",
+        f"/points/{rpid}/reservations/{mrid}/reschedule",
+        {
+            "cancel_token": mtoken,
+            "expected_revision": 2,
+            "idempotency_key": "visit-demo-move#r1",
+            "start": f"{tomorrow}T08:00:00Z",
+            "end": f"{tomorrow}T08:30:00Z",
+        },
+    )
+    show("same reschedule key + different content conflicts", status, diff_content)
+
+    status, stale = call(
+        "POST",
+        f"/points/{rpid}/reservations/{mrid}/reschedule",
+        {
+            "cancel_token": mtoken,
+            "expected_revision": 1,  # stale: the reservation is now at revision 2
+            "idempotency_key": "visit-demo-move#r2",
+            "start": f"{tomorrow}T10:00:00Z",
+            "end": f"{tomorrow}T10:30:00Z",
+        },
+    )
+    show("stale expected_revision conflicts", status, stale)
+
+    status, bad_token = call(
+        "POST",
+        f"/points/{rpid}/reservations/{mrid}/reschedule",
+        {
+            "cancel_token": "wrong",
+            "expected_revision": 2,
+            "idempotency_key": "visit-demo-move#r3",
+            "start": f"{tomorrow}T10:00:00Z",
+            "end": f"{tomorrow}T10:30:00Z",
+        },
+    )
+    show("wrong cancel token is refused (403)", status, bad_token)
+
+    status, moved_again = call(
+        "POST",
+        f"/points/{rpid}/reservations/{mrid}/reschedule",
+        {
+            "cancel_token": mtoken,
+            "expected_revision": 2,
+            "idempotency_key": "visit-demo-move#r4",
+            "start": f"{tomorrow}T10:00:00Z",
+            "end": f"{tomorrow}T10:30:00Z",
+        },
+    )
+    show("valid move to 10:00-10:30 (revision 2 -> 3)", status, moved_again)
+
+    status, create_replay = call("POST", f"/points/{rpid}/reservations", window_08)
+    show(
+        "original create key still replays the first booking (08:00-08:30)",
+        status,
+        create_replay,
+    )
+
 
 if __name__ == "__main__":
     main()

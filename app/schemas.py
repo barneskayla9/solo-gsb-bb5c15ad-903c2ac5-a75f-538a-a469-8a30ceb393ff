@@ -60,8 +60,9 @@ class PointUpdateIn(BaseModel):
     timezone: str | None = None
 
 
-class ReservationCreateIn(BaseModel):
-    idempotency_key: str = Field(min_length=1, max_length=200)
+class ReservationWindowIn(BaseModel):
+    """Shared time-window fields of create/reschedule requests."""
+
     start: datetime
     end: datetime
 
@@ -74,6 +75,16 @@ class ReservationCreateIn(BaseModel):
                 "(e.g. 2026-10-01T09:00:00Z)"
             )
         return value
+
+
+class ReservationCreateIn(ReservationWindowIn):
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class ReservationRescheduleIn(ReservationWindowIn):
+    cancel_token: str = Field(min_length=1)
+    expected_revision: int = Field(ge=1)
+    idempotency_key: str = Field(min_length=1, max_length=200)
 
 
 class ReservationCancelIn(BaseModel):
@@ -270,7 +281,7 @@ class VersionOut(BaseModel):
 
 
 class ReservationOut(BaseModel):
-    """Returned on creation and on same-content idempotent replays."""
+    """Returned on creation, reschedule and idempotent replays."""
 
     id: int
     point_id: int
@@ -278,6 +289,7 @@ class ReservationOut(BaseModel):
     start: str
     end: str
     rules_version: int
+    revision: int
     cancel_token: str
     created_at: datetime
     cancelled_at: datetime | None
@@ -292,5 +304,6 @@ class ReservationStateOut(BaseModel):
     start: str
     end: str
     rules_version: int
+    revision: int
     created_at: datetime
     cancelled_at: datetime | None
